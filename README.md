@@ -393,6 +393,34 @@ const createNewFoo = createFoo.static({
 console.log(createNewFoo.doFoo()); // logs 'bar'
 ```
 
+If a factory already has static properties, calling its static method again will not maintain those properties on the 
+returned factory. The original factory will still maintain its static properties.
+```typescript
+const createFoo = compose({
+	foo: 1
+}).static({
+	doFoo(): string {
+		return 'foo';
+	}
+})
+
+console.log(createFoo.doFoo()); //logs 'foo'
+
+const createFooBar = createFoo.static({
+	doBar(): string {
+		return 'bar';
+	}
+});
+
+console.log(createFooBar.doBar()); //logs 'bar'
+console.log(createFoo.doFoo()); //logs 'foo'
+//console.log(createFooBar.doFoo()); Doesn't compile
+//console.log(createFoo.doBar()); Doesn't compile
+```
+
+Static properties will also be lost when calling mixin or extend. Because of this, static properties should be applied
+to the 'final' factory in a chain.
+
 ## How do I use this package?
 
 For now, until the package is fully published you will need to clone the repository to your local machine:

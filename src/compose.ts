@@ -14,6 +14,11 @@ import {
 const initFnMap = new WeakMap<Function, ComposeInitializationFunction<any, any>[]>();
 
 /**
+ * A weakmap that will store static properties for compose factories
+ */
+const staticPropertyMap = new WeakMap<Function, {}>();
+
+/**
  * A helper funtion to return a function that is rebased to infer that the
  * first argument of the passed function will be the `this` when the function
  * is executed.
@@ -135,11 +140,6 @@ function cloneFactory(base?: any, staticProperties?: any): any {
 
 	if (base) {
 		copyProperties(factory.prototype, base.prototype);
-		// TODO or not TODO
-		// if (isComposeFactory(base)) {
-		// 	 copyProperties(factory, base);
-		// }
-		//
 		initFnMap.set(factory, [].concat(initFnMap.get(base)));
 	}
 	else {
@@ -148,6 +148,10 @@ function cloneFactory(base?: any, staticProperties?: any): any {
 	factory.prototype.constructor = factory;
 	stamp(factory);
 	if (staticProperties) {
+		if (isComposeFactory(staticProperties)) {
+			staticProperties = staticPropertyMap.get(staticProperties) || {};
+		}
+		staticPropertyMap.set(factory, staticProperties);
 		copyProperties(factory, staticProperties);
 	}
 	Object.freeze(factory);

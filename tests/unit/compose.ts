@@ -1269,6 +1269,22 @@ registerSuite({
 
 				assert.strictEqual(fooBar.bar, 1, 'Should have bar property');
 				assert.strictEqual(fooBar.foo, 3, 'Should have foo property');
+			},
+
+			'Passing a factory to static': function() {
+				const createFoo = compose({}).static({
+					doFoo: (): string => 'foo'
+				});
+
+				const createBar = compose({}).static(createFoo);
+
+				assert.strictEqual(createBar.doFoo(), 'foo', 'Should have transferred static property');
+			},
+
+			'Passing a factory with no static methods to static': function() {
+				assert.doesNotThrow(function() {
+					compose({}).static(compose({}));
+				}, 'Should have handled factory with no static methods without throwing');
 			}
 		}
 	}
