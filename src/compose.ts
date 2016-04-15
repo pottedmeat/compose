@@ -27,9 +27,9 @@ const staticPropertyMap = new WeakMap<Function, {}>();
  * @return    The rebased function
  */
 function rebase(fn: (base: any, ...args: any[]) => any): (...args: any[]) => any {
-   return function(...args: any[]) {
-	   return fn.apply(this, [ this ].concat(args));
-   };
+	return function(...args: any[]) {
+		return fn.apply(this, [ this ].concat(args));
+	};
 }
 
 /**
@@ -37,19 +37,19 @@ function rebase(fn: (base: any, ...args: any[]) => any): (...args: any[]) => any
  * from one or more sources to a target object. Includes non-enumerable properties
  */
 function copyProperties(target: {}, ...sources: {}[]) {
-  sources.forEach(source => {
-    Object.defineProperties(
-		target,
-		Object.getOwnPropertyNames(source).reduce(
-			(descriptors: { [ index: string ]: any }, key: string) => {
-				descriptors[ key ] = Object.getOwnPropertyDescriptor(source, key);
-				return descriptors;
-			},
-			{}
-		)
-	);
-  });
-  return target;
+	sources.forEach(source => {
+		Object.defineProperties(
+			target,
+			Object.getOwnPropertyNames(source).reduce(
+				(descriptors: { [ index: string ]: any }, key: string) => {
+					descriptors[ key ] = Object.getOwnPropertyDescriptor(source, key);
+					return descriptors;
+				},
+				{}
+			)
+		);
+	});
+	return target;
 }
 
 /* The rebased functions we need to decorate compose constructors with */
@@ -104,16 +104,16 @@ const doFactoryDescriptor = rebase(factoryDescriptor);
  * @param base The target constructor
  */
 function stamp(base: any): void {
-   base.extend = doExtend;
-   base.mixin = doMixin;
-   base.overlay = doOverlay;
-   base.from = doFrom;
-   base.before = doBefore;
-   base.after = doAfter;
-   base.around = doAround;
-   base.aspect = doAspect;
-   base.factoryDescriptor = doFactoryDescriptor;
-   base.static = doStatic;
+	base.extend = doExtend;
+	base.mixin = doMixin;
+	base.overlay = doOverlay;
+	base.from = doFrom;
+	base.before = doBefore;
+	base.after = doAfter;
+	base.around = doAround;
+	base.aspect = doAspect;
+	base.factoryDescriptor = doFactoryDescriptor;
+	base.static = doStatic;
 }
 
 /**
