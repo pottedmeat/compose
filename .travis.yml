@@ -1,23 +1,25 @@
 sudo: false
 language: node_js
 node_js:
-  - "5.1"
+- '5.1'
 env:
   global:
-    # Please get your own free key if you want to test yourself
-    - BROWSERSTACK_USERNAME: dtktestaccount1
-    - BROWSERSTACK_ACCESS_KEY: mG2qbEFJCZY2qLsM7yfx
-    - SAUCE_USERNAME: dojo2-ts-ci
-    - SAUCE_ACCESS_KEY: e92610e3-834e-4bec-a3b5-6f7b9d874601
+  - BROWSERSTACK_USERNAME: dtktestaccount1
+  - BROWSERSTACK_ACCESS_KEY: mG2qbEFJCZY2qLsM7yfx
+  - SAUCE_USERNAME: dojo2-ts-ci
+  - SAUCE_ACCESS_KEY: e92610e3-834e-4bec-a3b5-6f7b9d874601
 cache:
   directories:
-    - node_modules
+  - node_modules
 install:
-  - "npm install grunt-cli dojo-core"
-  - "npm install"
+- npm install grunt-cli dojo-core
+- npm install
 script:
-  - "grunt"
-  - "grunt intern:node --combined"
-  - "grunt intern:saucelabs --combined"
-  - "grunt remapIstanbul:ci"
-  - "grunt uploadCoverage"
+- grunt
+- grunt intern:node --combined
+- grunt intern:saucelabs --combined
+- grunt remapIstanbul:ci
+- grunt uploadCoverage
+notifications:
+  slack:
+    secure: a56Wj6uFLzdt3iCFw8W30VRLjARTwByc7MN+zll6jaPfm8DeGG3l2dE7HOZyn58E3JiKLc7kXQ9jAxe3UBL2V4tdK0ZSVUmVWiZmjU1oLjnMwTupj+ok+wSY7ILgpVWhTho5OUOcC0bQCOj2W9nh9c7lWhmK+y0Trrsgo5e8cgzFK4KUc/vCV6ytT73BEfPwyFX/37hBljBw4YICaJQvbk4K2l8Yj0vczbFRbPNMygPdiJCaHuknbNI3MgyX12fpCM5LA7fNpcUJRMldOag5nGgFAoYPDFTeK83X6DgkAbcsfCqZVTpVdKjnJetxlmrelEDTveYetqUl/tlOKTVzkraJ5ARwWOMdmirQ8dnRtbONArHNzILz/upDW7QgCBVayvV7KReFZbhKe43R2ZvOaKTMvtxk/qGVhSQJBYBP1j1C/8AyB9qniK2lp7Z8WDJLcmxJT1fBW1r74Hkt+LVUCFTmUjS6v47MvZxVd0K9Cz3lyAf5eloRPOL6wBbAcPw1i/DOa2SmpDuC84ZwJvPCYx6ndPohRZQ8AOhdJzNvFG7ZJzylCq+loMPVFwUQbIeQmcE/3eRDjvXY+Ahx8oNS9P4L9zHNJlODLCD6Ih1xK5UDYjIfoduaA5ZdS33lUWOpBg7ksH8VpWKzkglPwXjONr3p1g5aM8JnkdS/NyuGFEA=
