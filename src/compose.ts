@@ -99,6 +99,8 @@ function factoryDescriptor<T, O, U, P>(mixin: ComposeFactory<U, P>): ComposeMixi
  */
 const doFactoryDescriptor = rebase(factoryDescriptor);
 
+const doCreatedMixin = rebase(createdMixin);
+
 /**
  * A convenience function to decorate compose class constructors
  * @param base The target constructor
@@ -114,6 +116,7 @@ function stamp(base: any): void {
 	base.aspect = doAspect;
 	base.factoryDescriptor = doFactoryDescriptor;
 	base.static = doStatic;
+	base.createdMixin = doCreatedMixin;
 }
 
 /**
@@ -585,6 +588,100 @@ function aspect<T, O>(base: ComposeFactory<T, O>, advice: AspectAdvice): Compose
 	return clone;
 }
 
+interface ComposeCreatedMixin<T, O> extends ComposeFactory<T, O> {
+	execute<U, P>(toMixin: ComposeFactory<U, P>): ComposeFactory<T & U, O & P>;
+}
+
+class Mixin {
+	private _calls: ([string, any[]])[];
+	private _initFunction: ComposeInitializationFunction<any, any>;
+
+	constructor(initFunction?: ComposeInitializationFunction<any, any>) {
+		this._calls = [];
+		this._initFunction = initFunction;
+	}
+
+	execute<U, P>(toMixin: ComposeFactory<any, any>): ComposeFactory<any, any> {
+		let base: { [key: string]: Function } = <any> this,
+			calls = this._calls;
+		for (let i = 0; i < calls.length; i++) {
+			let [fn, args] = calls[i];
+			base[fn].apply(base, args);
+		}
+		return base as any;
+	}
+
+	create() {
+		// no-op
+		return this;
+	}
+
+	static(...args: any[]) {
+		this._calls.push(['static', args]);
+		return this;
+	}
+
+	extend(...args: any[]) {
+		this._calls.push(['extend', args]);
+		return this;
+	}
+
+	mixin(...args: any[]) {
+		this._calls.push(['mixin', args]);
+		return this;
+	}
+
+	overlay(...args: any[]) {
+		this._calls.push(['overlay', args]);
+		return this;
+	}
+
+	from(...args: any[]) {
+		this._calls.push(['from', args]);
+		return this;
+	}
+
+	before(...args: any[]) {
+		this._calls.push(['before', args]);
+		return this;
+	}
+
+	after(...args: any[]) {
+		this._calls.push(['after', args]);
+		return this;
+	}
+
+	around(...args: any[]) {
+		this._calls.push(['around', args]);
+		return this;
+	}
+
+	aspect(...args: any[]) {
+		this._calls.push(['extend', args]);
+		return this;
+	}
+}
+
+function createMixin<T, O>(initFunction?: ComposeInitializationFunction<T, O>): ComposeCreatedMixin<T, O> {
+	let mixin: any = new Mixin(initFunction);
+	return mixin;
+}
+
+export interface Compose {
+	createMixin<T, O>(initFunction?: ComposeInitializationFunction<T, O>): ComposeCreatedMixin<T, O>;
+}
+
+function createdMixin<T, O, U, P>(
+	base: ComposeFactory<T, O>,
+	toMixin: ComposeCreatedMixin<U, P>
+): ComposeFactory<T & U, O & P> {
+	return toMixin.execute(base);
+}
+
+export interface ComposeFactory<T, O> {
+	createdMixin<U, P>(toMixin: ComposeFactory<U, P>): ComposeFactory<T & U, O & P>;
+}
+
 /* Creation API */
 export interface ComposeFactory<T, O> extends ComposeMixinable<T, O> {
 	/**
@@ -675,5 +772,6 @@ compose.before = before;
 compose.after = after;
 compose.around = around;
 compose.aspect = aspect;
+compose.createMixin = createMixin;
 
 export default compose;

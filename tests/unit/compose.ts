@@ -1289,5 +1289,21 @@ registerSuite({
 				}, 'Should have handled factory with no static methods without throwing');
 			}
 		}
+	},
+	createMixin: {
+		'basic': function() {
+			const bar = compose.createMixin()
+				.extend({
+					bar: 'bar'
+				});
+			const createFooBar = compose({
+				foo: 'foo'
+			}).createdMixin(bar);
+
+			const fooBar = createFooBar();
+
+			assert.strictEqual(fooBar.foo, 'foo');
+			assert.strictEqual(fooBar.bar, 'bar');
+		}
 	}
 });
