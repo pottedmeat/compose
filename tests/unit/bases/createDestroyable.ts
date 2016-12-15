@@ -1,7 +1,7 @@
 import * as registerSuite from 'intern!object';
 import * as assert from 'intern/chai!assert';
 import { hasToStringTag } from '../../support/util';
-import createDestroyable, { isDestroyable } from '../../../src/mixins/createDestroyable';
+import createDestroyable, { isDestroyable } from '../../../src/bases/createDestroyable';
 
 registerSuite({
 	name: 'mixins/createDestroyable',

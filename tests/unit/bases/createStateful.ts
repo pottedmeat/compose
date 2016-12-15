@@ -2,14 +2,16 @@ import * as registerSuite from 'intern!object';
 import * as assert from 'intern/chai!assert';
 import { hasToStringTag } from '../../support/util';
 import Promise from 'dojo-shim/Promise';
+import { State } from 'dojo-interfaces/bases';
 import { Observable, Observer } from 'rxjs/Rx';
-import createStateful, { State } from '../../../src/mixins/createStateful';
+import createStateful from '../../../src/bases/createStateful';
 
 registerSuite({
 	name: 'mixins/createStateful',
 	creation: {
 		'no options'() {
 			const stateful = createStateful();
+			assert.isUndefined(stateful.stateFrom);
 			assert.deepEqual(stateful.state, {}, 'stateful should have empty state');
 			assert.isFunction(stateful.setState, 'stateful should have `setState` function');
 		},
@@ -41,6 +43,7 @@ registerSuite({
 			});
 
 			assert.strictEqual(called, 1);
+			assert.equal(stateful.stateFrom, observer);
 			assert.deepEqual(stateful.state, { foo: 'bar' });
 		},
 		'with id of 0'() {
@@ -111,13 +114,14 @@ registerSuite({
 
 		assert.throws(() => {
 			stateful.setState({ foo: 'bar' });
-		}, TypeError);
+		}, Error);
 	},
 	'setState'() {
 		const stateful = createStateful();
 		stateful.setState({
 			bar: 'foo'
 		});
+
 		assert.deepEqual(stateful.state, { bar: 'foo' });
 		stateful.setState({
 			foo: 1
@@ -198,7 +202,7 @@ registerSuite({
 				}
 			});
 
-			stateful.on('statecomplete', (evt) => {
+			stateful.on('state:completed', (evt) => {
 				called++;
 				assert.strictEqual(evt.target, stateful);
 			});
@@ -243,7 +247,7 @@ registerSuite({
 				}
 			});
 
-			stateful.on('statecomplete', (evt) => {
+			stateful.on('state:completed', (evt) => {
 				called++;
 				assert.strictEqual(evt.target, stateful);
 				evt.preventDefault();
@@ -350,28 +354,30 @@ registerSuite({
 			});
 		}
 	},
-	'"statechange" event type': {
+	'"state:changed" event type': {
 		'local state'() {
 			let count = 0;
 			interface TestState {
 				foo?: string;
 			}
 
-			const stateful = createStateful<TestState>();
+			const stateful = createStateful<TestState>({
+				state: {
+					foo: 'foo'
+				}
+			});
 
-			stateful.on('statechange', (event) => {
+			stateful.on('state:changed', (event) => {
 				count++;
 				assert.strictEqual(event.target, stateful);
-				assert.strictEqual(event.type, 'statechange');
+				assert.strictEqual(event.type, 'state:changed');
 				assert.deepEqual(event.state, { foo: 'bar' });
 				assert.strictEqual(event.state, event.target.state);
 			});
 
 			assert.strictEqual(count, 0, 'listener not called yet');
 
-			stateful.setState({
-				foo: 'bar'
-			});
+			stateful.setState({ foo: 'bar' });
 
 			assert.strictEqual(count, 1, 'listener called once');
 		},
@@ -402,18 +408,19 @@ registerSuite({
 			const stateful = createStateful({
 				id: 'foo',
 				stateFrom: observer,
-				listeners: { 'statechange'() { count++; } }
+				listeners: { 'state:changed'() { count++; } }
 			});
 
 			assert.deepEqual(stateful.state, { foo: 'bar' });
 
-			assert.strictEqual(count, 1, 'listener called once');
+			assert.strictEqual(count, 1, 'listener not called');
 
-			stateful.setState({ foo: 'qat' });
+			const state = { foo: 'qat' };
+			stateful.setState(state);
 
 			assert.strictEqual(patchCount, 1, 'patch should have been called');
-			assert.deepEqual(stateful.state, { foo: 'qat' });
-			assert.strictEqual(count, 2, 'listener called again');
+			assert.deepEqual(stateful.state, state);
+			assert.strictEqual(count, 2, 'listener called');
 		}
 	},
 	'toString()'(this: any) {

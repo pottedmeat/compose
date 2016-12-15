@@ -1,7 +1,7 @@
 import * as registerSuite from 'intern!object';
 import * as assert from 'intern/chai!assert';
 import { hasToStringTag } from '../../support/util';
-import createEvented from '../../../src/mixins/createEvented';
+import createEvented from '../../../src/bases/createEvented';
 
 registerSuite({
 	name: 'mixins/createEvented',

@@ -1,10 +1,11 @@
 import { Handle } from 'dojo-core/interfaces';
 import { deepAssign } from 'dojo-core/lang';
-import Promise from 'dojo-core/Promise';
-import WeakMap from 'dojo-core/WeakMap';
-import { Observable, Subscription } from 'rxjs/Rx';
+import Promise from 'dojo-shim/Promise';
+import WeakMap from 'dojo-shim/WeakMap';
+import { Observable, Subscription } from './interfaces';
 import createEvented, { Evented, EventedOptions, EventedListener, TargettedEventObject } from './createEvented';
-import compose, { ComposeFactory } from '../compose';
+import { ComposeFactory } from '../compose';
+import createCancelableEvent, { CancelableEvent } from './../util/createCancelableEvent';
 
 /**
  * Base State interface
@@ -68,7 +69,7 @@ export interface StatefulMixin<S extends State>{
 	/**
 	 * A read only view of the state
 	 */
-	state: S;
+	readonly state: S;
 
 	/**
 	 * Set the state on the instance.
@@ -91,7 +92,18 @@ export interface StatefulMixin<S extends State>{
 
 export type Stateful<S extends State> = StatefulMixin<S> & Evented & {
 	/**
-	 * Add a listener for an event
+	 * Add a listener for a `statecomplete` event, which occures when state is observed
+	 * and is completed.  If the event is not cancelled, the instance will continue and
+	 * call `target.destroy()`.
+	 *
+	 * @param type The event type to listen for
+	 * @param listener The listener that will be called when the event occurs
+	 */
+	on(type: 'statecomplete', listener: EventedListener<CancelableEvent<'statecomplete', Stateful<S>>>): Handle;
+
+	/**
+	 * Add a listener for a `statechange` event, which occures whenever the state changes on the instance.
+	 *
 	 * @param type The event type to listen for
 	 * @param listener The listener that will be called when the event occurs
 	 */
@@ -119,23 +131,30 @@ interface ObservedState {
 const observedStateMap = new WeakMap<Stateful<State>, ObservedState>();
 
 /**
- * Internal function to unobserve the state of a `Stateful`
+ * Internal function to unobserve the state of a `Stateful`.  It emits a `statecomplete` event which can be
+ * cancelled.
+ *
  * @param stateful The `Stateful` object to unobserve
  */
 function unobserve(stateful: Stateful<State>): void {
 	const observedState = observedStateMap.get(stateful);
 	if (observedState) {
 		observedState.handle.destroy();
-		stateful.emit({
-			type: 'observe:complete',
+		const statecomplete = createCancelableEvent({
+			type: 'statecomplete',
 			target: stateful
 		});
+		stateful.emit(statecomplete);
+		if (!statecomplete.defaultPrevented) {
+			stateful.destroy();
+		}
 	}
 }
 
 /**
  * Internal function that actually applies the state to the Stateful's state and
  * emits the `statechange` event.
+ *
  * @param stateful The Stateful instance
  * @param state The State to be set
  */
@@ -156,80 +175,77 @@ const stateWeakMap = new WeakMap<Stateful<State>, State>();
 /**
  * Create an instance of a stateful object
  */
-const createStateful: StatefulFactory = compose<StatefulMixin<State>, StatefulOptions<State>>({
-		get state(): any {
-			return stateWeakMap.get(this);
-		},
+const createStateful: StatefulFactory = createEvented
+	.mixin({
+		className: 'Stateful',
+		mixin: {
+			get state(this: Stateful<State>): State {
+				return stateWeakMap.get(this);
+			},
 
-		setState(value: State): void {
-			const stateful: Stateful<State> = this;
-			const observedState = observedStateMap.get(stateful);
-			if (observedState) {
-				observedState.observable.patch(value, { id: observedState.id });
-			}
-			else {
-				setStatefulState(stateful, value);
-			}
-		},
-
-		observeState(id: string, observable: ObservableState<State>): Handle {
-			const stateful: Stateful<State> = this;
-			let observedState = observedStateMap.get(stateful);
-			if (observedState) {
-				if (observedState.id === id && observedState.observable === observable) {
-					return observedState.handle;
+			setState(this: Stateful<State>, value: State): void {
+				const observedState = observedStateMap.get(this);
+				if (observedState) {
+					observedState.observable.patch(value, { id: observedState.id });
 				}
-				throw new Error(`Already observing state with ID '${observedState.id}'`);
-			}
-			observedState = {
-				id,
-				observable,
-				subscription: observable
-					.observe(id)
-					.subscribe(
-						(item) => setStatefulState(stateful, item), /* next handler */
-						(err) => {
-							/* TODO: Should we emit an error, instead of throwing? */
-							throw err;
-						}, /* error handler */
-						() => unobserve(stateful)), /* completed handler */
-				handle: {
-					destroy() {
-						const observedState = observedStateMap.get(stateful);
-						if (observedState) {
-							observedState.subscription.unsubscribe();
-							observedStateMap.delete(stateful);
+				else {
+					setStatefulState(this, value);
+				}
+			},
+
+			observeState(this: Stateful<State>, id: string, observable: ObservableState<State>): Handle {
+				let observedState = observedStateMap.get(this);
+				if (observedState) {
+					if (observedState.id === id && observedState.observable === observable) {
+						return observedState.handle;
+					}
+					throw new Error(`Already observing state with ID '${observedState.id}'`);
+				}
+				const stateful = this;
+				observedState = {
+					id,
+					observable,
+					subscription: observable
+						.observe(id)
+						.subscribe(
+							(item) => setStatefulState(stateful, item), /* next handler */
+							(err) => {
+								/* TODO: Should we emit an error, instead of throwing? */
+								throw err;
+							}, /* error handler */
+							() => unobserve(stateful)), /* completed handler */
+					handle: {
+						destroy() {
+							const observedState = observedStateMap.get(stateful);
+							if (observedState) {
+								observedState.subscription.unsubscribe();
+								observedStateMap.delete(stateful);
+							}
 						}
 					}
-				}
-			};
-			observedStateMap.set(stateful, observedState);
-			return observedState.handle;
-		}
-	}, (instance, options) => {
-		if (options) {
-			const { state } = options;
-			if (state) {
-				instance.setState(state);
+				};
+				observedStateMap.set(stateful, observedState);
+				return observedState.handle;
 			}
-		}
-	})
-	.mixin({
-		mixin: createEvented,
-		initialize(instance, options) {
-			stateWeakMap.set(instance, {});
+		},
+		initialize(instance: StatefulMixin<State> & Evented, options: StatefulOptions<State>) {
+			/* Using Object.create(null) will improve performance when looking up properties in state */
+			stateWeakMap.set(instance, Object.create(null));
 			instance.own({
 				destroy() {
 					stateWeakMap.delete(instance);
 				}
 			});
 			if (options) {
-				const { id, stateFrom } = options;
-				if (id && stateFrom) {
+				const { id, stateFrom, state } = options;
+				if (typeof id !== 'undefined' && stateFrom) {
 					instance.own(instance.observeState(id, stateFrom));
 				}
-				else if (id || stateFrom) {
-					throw new TypeError('Factory requires options "id" and "stateFrom" to be supplied together.');
+				else if (stateFrom) {
+					throw new TypeError('When "stateFrom" option is supplied, factory also requires "id" option.');
+				}
+				if (state) {
+					instance.setState(state);
 				}
 			}
 		}

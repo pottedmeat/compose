@@ -242,7 +242,7 @@ const fooBar = fooBarFactory();
 
 fooBar.bar(); // logs "bar"
 ```
-The real beneif of using `mixin` is in those cases where simply modifying the type is not enough, and there is additional behavior that needs to be included via an initialization function or aspects.
+The real benefit of using `mixin` is in those cases where simply modifying the type is not enough, and there is additional behavior that needs to be included via an initialization function or aspects.
 ```typescript
 import * as compose from 'dojo/compose';
 
@@ -321,6 +321,36 @@ console.log(fooBar.bar) // logs 3
 The previous example, where a `ComposeFactory` was passed directly to `mixin` is possible because as a convenience all instances of `ComposeFactory`
 are initialized with a version of the `factoryDescriptor` function that simply returns the factory itself as the `mixin` property. If a more complicated
 factory descriptor is required, the `factoryDescriptor` method can be overridden using the `static` method, documented below.
+
+### Merging of Arrays
+
+When mixing in or extending classes which contain array literals as a value of a property, `compose` will merge these values
+instead of over writting, which it does with other value types.
+
+For example, if I have an array of strings in my original class, and provide a mixin which shares the same property that is
+also an array, those will get merged:
+
+```typescript
+const createFoo = compose({
+	foo: [ 'foo' ]
+});
+
+const createBarMixin = compose({
+	foo: [ 'bar' ]
+});
+
+const createFooBar = createFoo.mixin(createBarMixin);
+
+const foo = createFooBar();
+
+foo.foo; // [ 'foo', 'bar' ]
+```
+
+There are some things to note:
+
+* The merge process will eliminate duplicates.
+* When the factory is invoked, it will "duplicate" the array from the prototype, so `createFoo.prototype.foo !== foo.foo`.
+* If the source and the target are not arrays, like other mixing in, last one wins.
 
 ### Using Generics
 

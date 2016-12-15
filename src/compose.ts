@@ -1,4 +1,8 @@
-import WeakMap from 'dojo-core/WeakMap';
+import { deprecated } from 'dojo-core/instrument';
+import { assign } from 'dojo-core/lang';
+import { from as arrayFrom, includes } from 'dojo-shim/array';
+import WeakMap from 'dojo-shim/WeakMap';
+import Symbol from 'dojo-shim/Symbol';
 import {
 	before as aspectBefore,
 	after as aspectAfter,
@@ -9,14 +13,149 @@ import {
 } from './aspect';
 
 /**
- * A weakmap that will store initialization functions for compose constructors
+ * A tuple of advice types and advice
  */
-const initFnMap = new WeakMap<Function, ComposeInitializationFunction<any, any>[]>();
+type AdviceTuple = ['before', BeforeAdvice] | ['after', AfterAdvice<any>] | ['around', AroundAdvice<any>];
 
 /**
- * A weakmap that will store static properties for compose factories
+ * A map of advice to apply to a method, with the `method` key being a tuple of advice
  */
-const staticPropertyMap = new WeakMap<Function, {}>();
+type AdviceMap = {
+	[method: string]: AdviceTuple[];
+};
+
+/**
+ * Interface for storing the private meta data related to a factory
+ */
+interface PrivateFactoryData {
+	/**
+	 * A map of advice that should be applied to a prototype of a factory as it is being constructed
+	 */
+	advice?: AdviceMap;
+
+	/**
+	 * The base prototype that contains the methods and properties without advice applied
+	 */
+	base?: any;
+
+	/**
+	 * The array of initialization functions that should be applied to the instance upon creation
+	 */
+	initFns: ComposeInitializationFunction<any, any>[];
+
+	/**
+	 * Any static properties/methods that should be applied when creating a factory
+	 */
+	staticProperties?: any;
+}
+
+/**
+ * The default factory label if no label can be derived during the factory creation process
+ */
+const DEFAULT_FACTORY_LABEL = 'Compose';
+
+/* References to support minification */
+const defineProperty = Object.defineProperty;
+const isArray = Array.isArray;
+const objectCreate = Object.create;
+const objectKeys = Object.keys;
+
+/**
+ * A weakmap that stores all the private data for a factory
+ */
+const privateFactoryData = new WeakMap<Function, PrivateFactoryData>();
+
+/**
+ * An internal function which stubs out a method which, when called at runtime, throws.
+ *
+ * @param method The name of "abstract" method being called
+ */
+function missingMethod(method: string): () => never {
+	return function throwOnMissingMethod(): never {
+		throw new TypeError(`Advice being applied to missing method named: ${method}`);
+	};
+}
+
+/**
+ * Internal function which can label a factory with a name and also sets
+ * the `toString()` method on the prototype to return the approriate
+ * name for instances.
+ *
+ * @param fn The name of the factory to label
+ * @param value The name to supply for the label
+ */
+function assignFactoryName(factory: Function, value: string): void {
+	if (typeof factory === 'function' && factory.prototype) {
+		assignFunctionName(factory, value);
+		defineProperty(factory.prototype, <any> Symbol.toStringTag, {
+			get() {
+				return value;
+			},
+			configurable: true
+		});
+	}
+}
+
+/**
+ * Internal function which can label a function with a name
+ */
+function assignFunctionName(fn: Function, value: string): void {
+	const nameDescriptor = Object.getOwnPropertyDescriptor(fn, 'name');
+	if (typeof nameDescriptor === 'undefined' || nameDescriptor.configurable) {
+		defineProperty(fn, 'name', {
+			value,
+			writable: true,
+			configurable: true
+		});
+	}
+}
+
+/**
+ * A helper function that copies own properties and their descriptors
+ * from one or more sources to a target object. Includes non-enumerable properties
+ *
+ * @param overwrite If `true` properties, like arrays, will not be merged, instead overwritten
+ * @param target The target that properties should be copied onto
+ * @param sources The rest of the parameters treated as sources to apply
+ */
+function assignProperties(overwrite: boolean, target: any, ...sources: any[]) {
+	sources.forEach((source) => {
+		if (!source) {
+			return;
+		}
+		Object.defineProperties(
+			target,
+			Object.getOwnPropertyNames(source).reduce(
+				(descriptors: PropertyDescriptorMap, key: string) => {
+					if (key !== 'constructor') { /* don't copy constructor */
+						const sourceDescriptor = Object.getOwnPropertyDescriptor(source, key);
+						const sourceValue = sourceDescriptor && sourceDescriptor.value;
+						const targetDescriptor = Object.getOwnPropertyDescriptor(target, key);
+						const targetValue = targetDescriptor && targetDescriptor.value;
+
+						/* Special handling to merge array proprties */
+						if (!overwrite && isArray(sourceValue) && isArray(targetValue)) {
+							sourceDescriptor.value = sourceValue.reduce(
+								(value: any[], current: any) => {
+									if (!includes(target[key], current)) {
+										value.push(current);
+									}
+									return value;
+								},
+								arrayFrom(targetValue)
+							);
+						}
+
+						descriptors[key] = sourceDescriptor;
+					}
+					return descriptors;
+				},
+				objectCreate(null)
+			)
+		);
+	});
+	return target;
+}
 
 /**
  * A helper funtion to return a function that is rebased to infer that the
@@ -27,35 +166,30 @@ const staticPropertyMap = new WeakMap<Function, {}>();
  * @return    The rebased function
  */
 function rebase(fn: (base: any, ...args: any[]) => any): (...args: any[]) => any {
-	return function(...args: any[]) {
+	return function(this: any, ...args: any[]) {
 		return fn.apply(this, [ this ].concat(args));
 	};
 }
 
 /**
- * A helper function that copies own properties and their descriptors
- * from one or more sources to a target object. Includes non-enumerable properties
+ * For a given factory, return the names of the initialization functions that will be
+ * invoked upon construction.
+ *
+ * @param factory The factory that the array of function names should be returned for
  */
-function copyProperties(target: {}, ...sources: {}[]) {
-	sources.forEach(source => {
-		Object.defineProperties(
-			target,
-			Object.getOwnPropertyNames(source).reduce(
-				(descriptors: { [ index: string ]: any }, key: string) => {
-					descriptors[ key ] = Object.getOwnPropertyDescriptor(source, key);
-					return descriptors;
-				},
-				{}
-			)
-		);
-	});
-	return target;
+export function getInitFunctionNames(factory: ComposeFactory<any, any>): string[] | undefined {
+	const initFns = privateFactoryData.get(factory).initFns;
+	if (initFns) {
+		return initFns.map((fn) => (<any> fn).name);
+	}
 }
 
 /* The rebased functions we need to decorate compose constructors with */
 
 /**
  * Perform an extension of a class
+ *
+ * @deprecated
  */
 const doExtend = rebase(extend);
 
@@ -63,6 +197,11 @@ const doExtend = rebase(extend);
  * Perform a mixin of a class
  */
 const doMixin = rebase(mixin);
+
+/**
+ * Perform a override of a class
+ */
+const doOverride = rebase(override);
 
 /**
  * Perform an overlay of a class
@@ -90,7 +229,8 @@ const doStatic = rebase(_static);
  */
 function factoryDescriptor<T, O, U, P>(mixin: ComposeFactory<U, P>): ComposeMixinDescriptor<T, O, U, P> {
 	return {
-		mixin: mixin
+		mixin,
+		className: mixin.name
 	};
 };
 
@@ -99,93 +239,209 @@ function factoryDescriptor<T, O, U, P>(mixin: ComposeFactory<U, P>): ComposeMixi
  */
 const doFactoryDescriptor = rebase(factoryDescriptor);
 
-const doCreatedMixin = rebase(createdMixin);
+/**
+ * A set of functions that are used to decorate the compose factories
+ */
+const staticMethods = {
+	extend: doExtend, /* DEPRECATED */
+	mixin: doMixin,
+	override: doOverride,
+	overlay: doOverlay,
+	from: doFrom,
+	before: doBefore,
+	after: doAfter,
+	around: doAround,
+	aspect: doAspect,
+	factoryDescriptor: doFactoryDescriptor,
+	static: doStatic
+};
 
 /**
- * A convenience function to decorate compose class constructors
+ * A convenience function to decorate compose class factories, including any static prpoerties
+ *
  * @param base The target constructor
  */
-function stamp(base: any): void {
-	base.extend = doExtend;
-	base.mixin = doMixin;
-	base.overlay = doOverlay;
-	base.from = doFrom;
-	base.before = doBefore;
-	base.after = doAfter;
-	base.around = doAround;
-	base.aspect = doAspect;
-	base.factoryDescriptor = doFactoryDescriptor;
-	base.static = doStatic;
-	base.createdMixin = doCreatedMixin;
+interface FactoryOptions<T, U, O, S> {
+	/**
+	 * A map of advice to be applied to be merged with any advice from factories and then applied to the prototype
+	 */
+	advice?: AdviceMap;
+
+	/**
+	 * Any factories to mixin to this factory
+	 */
+	factories?: ComposeFactory<U, O>[];
+
+	/**
+	 * Adds an init function to the factory
+	 */
+	initFunction?: ComposeInitializationFunction<any, O>;
+
+	/**
+	 * The name of the class which the factory will construct
+	 */
+	className?: string;
+
+	/**
+	 * The prototype will always overwrite the base, instead of merging any special properties
+	 */
+	overwrite?: boolean;
+
+	/**
+	 * The prototype to mix into the base
+	 */
+	proto?: T;
+
+	/**
+	 * Any static properties to be added to the factory
+	 */
+	staticProperties?: S;
 }
 
 /**
- * Take a compose factory and clone it
+ * Internal function that merges (or creates) an advice map
  *
- * @param  base             The base to clone
- * @param  staticProperties Any static properties for the factory
- * @return                  The cloned constructor function
+ * @param sources The advice maps to be merged into a single one
  */
-function cloneFactory<T, O, S>(base: ComposeFactory<T, O>, staticProperties: S): ComposeFactory<T, O> & S;
-function cloneFactory<T, O>(base: ComposeFactory<T, O>): ComposeFactory<T, O>;
-function cloneFactory<T, O>(): ComposeFactory<T, O>;
-function cloneFactory(base?: any, staticProperties?: any): any {
+function assignAdviceMap(...sources: (AdviceMap | undefined)[]): AdviceMap {
+	const result: AdviceMap = {};
+	sources.forEach((source) => {
+		if (source) {
+			for (const method in source) {
+				result[method] = result[method] ? [ ...result[method], ...source[method] ] : [ ...source[method] ];
+			}
+		}
+	});
+	return result;
+}
 
-	function factory(...args: any[]): any {
+/**
+ * An internal function that takes a set of create widget options and returns a set of private factory data
+ *
+ * @param options The set of factory options to use in creating the private factory data
+ */
+function createPrivateFactoryData({
+	advice: optionsAdvice,
+	factories,
+	initFunction,
+	overwrite,
+	proto,
+	staticProperties
+}: FactoryOptions<any, any, any, any>): PrivateFactoryData {
+	const factoryData = (factories || []).reduce((factoryData, factory) => {
+		const { advice, base, initFns } = privateFactoryData.get(factory);
+		if (advice) {
+			factoryData.advice = assignAdviceMap(factoryData.advice, advice);
+		}
+		if (base) {
+			assignProperties(false, factoryData.base, base);
+		}
+		const optionsInitFns = factoryData.initFns;
+		initFns.forEach((initFn) => {
+			if (!includes(optionsInitFns, initFn)) {
+				optionsInitFns.push(initFn);
+			}
+		});
+		return factoryData;
+	}, {
+		base: {},
+		initFns: [],
+		staticProperties: staticProperties ? assign({}, staticProperties) : undefined
+	} as PrivateFactoryData);
+
+	if (initFunction) {
+		factoryData.initFns.push(initFunction);
+	}
+
+	if (optionsAdvice) {
+		factoryData.advice = assignAdviceMap(factoryData.advice, optionsAdvice);
+	}
+
+	assignProperties(Boolean(overwrite), factoryData.base, proto);
+
+	return factoryData;
+}
+
+function createFactory<T, U, O, S>(options: FactoryOptions<T, U, O, S>): ComposeFactory<T & U, O> & S;
+function createFactory<T, U, O>(options: FactoryOptions<T, U, O, any>): ComposeFactory<T & U, O> & any {
+
+	/**
+	 * A compose factory
+	 */
+	function factory(this: ComposeFactory<any, any>, ...args: any[]): any {
 		if (this && this.constructor === factory) {
 			throw new SyntaxError('Factories cannot be called with "new".');
 		}
-		const instance = Object.create(factory.prototype);
+		const instance = objectCreate(factory.prototype);
+
+		/* clone any arrays in the instance */
+		for (const key in instance) {
+			if (isArray(Object.getOwnPropertyDescriptor(factory.prototype, key).value)) {
+				instance[key] = arrayFrom(instance[key]);
+			}
+		}
+
 		args.unshift(instance);
-		initFnMap.get(factory).forEach(fn => fn.apply(null, args));
+		privateFactoryData.get(factory).initFns.forEach(fn => {
+			fn.apply(null, args);
+		});
 		return instance;
 	}
 
-	if (base) {
-		copyProperties(factory.prototype, base.prototype);
-		initFnMap.set(factory, [].concat(initFnMap.get(base)));
-	}
-	else {
-		initFnMap.set(factory, []);
-	}
-	factory.prototype.constructor = factory;
-	stamp(factory);
-	if (staticProperties) {
-		if (isComposeFactory(staticProperties)) {
-			staticProperties = staticPropertyMap.get(staticProperties) || {};
+	const factoryData = createPrivateFactoryData(options);
+
+	privateFactoryData.set(factory, factoryData);
+
+	const factoryPrototype = factory.prototype;
+
+	/* mixin base properties into the prototype */
+	assignProperties(false, factoryPrototype, factoryData.base);
+
+	/* apply any advice to the prototype */
+	if (factoryData.advice) {
+		for (const method in factoryData.advice) {
+			factoryData.advice[method].forEach(([ aspect, advice ]) => {
+				const sourceMethod = factoryPrototype[method] || missingMethod(method);
+				switch (aspect) {
+				case 'before':
+					factoryPrototype[method] = aspectBefore(sourceMethod, <BeforeAdvice> advice);
+					break;
+				case 'after':
+					factoryPrototype[method] = aspectAfter(sourceMethod, <AfterAdvice<any>> advice);
+					break;
+				case 'around':
+					factoryPrototype[method] = aspectAround(sourceMethod, <AroundAdvice<any>> advice);
+				}
+			});
 		}
-		staticPropertyMap.set(factory, staticProperties);
-		copyProperties(factory, staticProperties);
 	}
+
+	/* assign a constructor to the prototype */
+	factoryPrototype.constructor = factory;
+
+	/* assign static methods/properties */
+	assign(factory, staticMethods, factoryData.staticProperties);
+
+	/* assign factory name */
+	const className = options.className ||
+		(options.factories && options.factories[0] && options.factories[0].name) ||
+		DEFAULT_FACTORY_LABEL;
+	assignFactoryName(factory, className);
+
+	/* freeze the factory, so it cannot be accidently modified */
 	Object.freeze(factory);
 
-	return factory;
-}
-
-/**
- * Takes any init functions from source and concats them to base
- * @param target The compose factory to copy the init functions onto
- * @param source The ComposeFactory to copy the init functions from
- */
-function concatInitFn<T, O, U, P>(target: ComposeFactory<T, O>, source: ComposeFactory<U, P>): void {
-	const sourceInitFns = initFnMap.get(source);
-
-	/* making sure only unique functions get added */
-	const targetInitFns = initFnMap.get(target).filter((fn) => {
-		return sourceInitFns.indexOf(fn) < 0;
-	});
-
-	/* now prepend the source init functions to the unique init functions for the target */
-	initFnMap.set(target, sourceInitFns.concat(targetInitFns));
+	return factory as ComposeFactory<any, any>;
 }
 
 /**
  * A custom type guard that determines if the value is a ComposeFactory
+ *
  * @param   value The target to check
  * @returns       Return true if it is a ComposeFactory, otherwise false
  */
 export function isComposeFactory(value: any): value is ComposeFactory<any, any> {
-	return Boolean(initFnMap.get(value));
+	return Boolean(value && privateFactoryData.get(value));
 }
 
 /* General Interfaces */
@@ -195,24 +451,49 @@ export function isComposeFactory(value: any): value is ComposeFactory<any, any> 
  */
 export interface GenericClass<T> {
 	new (...args: any[]): T;
-	prototype: T;
+	readonly prototype: T;
 }
 
-export interface ComposeInitializationFunction<T, O> {
+/**
+ * Used to adapt functions within compose
+ */
+export interface GenericFunction<T> {
+	(...args: any[]): T;
+}
+
+/**
+ * A basic string index map of options
+ */
+export interface Options {
+	[options: string]: any;
+}
+
+export interface ComposeInitializationFunction<T, O extends Options> {
 	/**
 	 * A callback function use to initialize a new created instance
+	 *
 	 * @param instance The newly constructed instance
 	 * @param options Any options that were passed to the factory
 	 * @template T The type of the instance
 	 * @template O The type of the options being passed
 	 */
 	(instance: T, options?: O): void;
+
+	/**
+	 * A string name of the function, used for debugging purposes
+	 */
+	readonly name?: string;
 }
 
 /* Extension API */
-export interface ComposeFactory<T, O> extends ComposeMixinable<T, O> {
+
+/* DEPRECATED - This API will be removed in the future */
+
+export interface ComposeFactory<T, O extends Options> extends ComposeMixinable<T, O> {
 	/**
 	 * Extend the factory prototype with the supplied object literal, class, or factory
+	 *
+	 * @deprecated
 	 * @param extension The object literal, class or factory to extend
 	 * @template T The original type of the factory
 	 * @template U The type of the extension
@@ -220,13 +501,17 @@ export interface ComposeFactory<T, O> extends ComposeMixinable<T, O> {
 	 * @template P The type of the extension factory options
 	 */
 	extend<U>(extension: U | GenericClass<U>): ComposeFactory<T & U, O>;
+	extend<U>(className: string, extension: U | GenericClass<U>): ComposeFactory<T & U, O>;
 	extend<U, P>(extension: ComposeFactory<U, P>): ComposeFactory<T & U, O & P>;
+	extend<U, P>(className: string, extension: ComposeFactory<U, P>): ComposeFactory<T & U, O & P>;
 }
 
 export interface Compose {
 	/**
 	 * Extend a compose factory prototype with the supplied object literal, class, or
 	 * factory.
+	 *
+	 * @deprecated
 	 * @param base The base compose factory to extend
 	 * @param extension The object literal, class or factory that is the extension
 	 * @template T The base type of the factory
@@ -235,17 +520,115 @@ export interface Compose {
 	 * @template P The type of the extension factory options
 	 */
 	extend<T, O, U>(base: ComposeFactory<T, O>, extension: U | GenericClass<U>): ComposeFactory<T & U, O>;
+	extend<T, O, U>(base: ComposeFactory<T, O>, className: string, extension: U | GenericClass<U>): ComposeFactory<T & U, O>;
 	extend<T, O, U, P>(base: ComposeFactory<T, O>, extension: ComposeFactory<U, P>): ComposeFactory<T & U, O & P>;
+	extend<T, O, U, P>(base: ComposeFactory<T, O>, className: string, extension: ComposeFactory<U, P>): ComposeFactory<T & U, O & P>;
 }
 
+/**
+ * The internal implementation of extending a compose factory
+ *
+ * @deprecated
+ * @param base The base compose factory that is being extended
+ * @param extension The extension to apply to the compose factory
+ */
 function extend<T, O, U, P>(base: ComposeFactory<T, O>, extension: ComposeFactory<U, P>): ComposeFactory<T & U, O & P>;
-function extend<O>(base: ComposeFactory<any, O>, extension: any): ComposeFactory<any, O> {
-	base = cloneFactory(base);
-	copyProperties(base.prototype, typeof extension === 'function' ? extension.prototype : extension);
-	return base;
+function extend<T, O, U, P>(base: ComposeFactory<T, O>, className: string, extension: ComposeFactory<U, P>): ComposeFactory<T & U, O & P>;
+function extend<O>(base: ComposeFactory<any, O>, className: any, extension?: any): ComposeFactory<any, O> {
+	deprecated({ message: 'This function will be removed, use "override" instead.', name: 'extend' });
+	if (typeof className !== 'string') {
+		extension = className;
+		className = undefined;
+	}
+
+	return createFactory({
+		className,
+		proto: typeof extension === 'function' ? extension.prototype : extension,
+		factories: [ base ]
+	});
+}
+
+/* Override API */
+
+export interface ComposeFactory<T, O extends Options> extends ComposeMixinable<T, O> {
+	/**
+	 * Override certain properties on the existing factory, returning a new factory.  If the properties
+	 * are not present in the existing factory, override will throw.
+	 *
+	 * @param properties The properties to override
+	 */
+	override(properties: any): this;
+
+	/**
+	 * Override certain properties on the existing factory, returning a new factory.  If the properties
+	 * are not present in the existing factory, override with throw.
+	 *
+	 * @param className The class name for the factory
+	 * @param properties The properties to override
+	 */
+	override(className: string, properties: any): this;
+}
+
+export interface Compose {
+	/**
+	 * Override properties on a compose factory, returning a new factory.  If the properties are not
+	 * present on the base factory, override will throw.
+	 *
+	 * @param baseFactory The base compose factory to override
+	 * @param properties The properties to override
+	 */
+	override<T, O>(baseFactory: ComposeFactory<T, O>, properties: any): ComposeFactory<T, O>;
+
+	/**
+	 * Override properties on a compose factory, returning a new factory.  If the properties are not
+	 * present on the base factory, override will throw.
+	 *
+	 * @param baseFactory The base compose factory to override
+	 * @param className The class name for the factory
+	 * @param properties The properties to override
+	 */
+	override<T, O>(baseFactory: ComposeFactory<T, O>, className: string, properties: any): ComposeFactory<T, O>;
+}
+
+/**
+ * The internal implementation of overriding properties on a compose factory
+ *
+ * @param baseFactory The base factory
+ * @param className The name of the class that will be produced by the factory
+ * @param properties The object that contains the properties to override
+ */
+function override<T, O>(baseFactory: ComposeFactory<T, O>, properties: any): ComposeFactory<T, O>;
+function override<T, O>(baseFactory: ComposeFactory<T, O>, className: string, properties: any): ComposeFactory<T, O>;
+function override<T, O>(baseFactory: ComposeFactory<T, O>, className: any, properties?: any): ComposeFactory<T, O> {
+	if (typeof className !== 'string') {
+		properties = className;
+		className = undefined;
+	}
+
+	if (typeof properties !== 'object') {
+		throw new TypeError('Argument "properties" must be an object.');
+	}
+
+	const base = privateFactoryData.get(baseFactory).base;
+
+	/* TODO: In TypeScript 2.1 we have merge types which can then be used to provide type checking at design time
+	 * similiar to this */
+	Object.keys(properties).forEach((key) => {
+		if (!(key in base)) {
+			throw new TypeError(`Attempting to override missing property "${key}"`);
+		}
+	});
+
+	return createFactory({
+		className,
+		overwrite: true,
+		proto: properties,
+		factories: [ baseFactory ]
+	});
 }
 
 /* Overlay API */
+
 export interface OverlayFunction<T> {
 	/**
 	 * A function that takes a factories prototype, allowing it to change the prototype without
@@ -257,7 +640,7 @@ export interface OverlayFunction<T> {
 	(proto: T): void;
 }
 
-export interface ComposeFactory<T, O> extends ComposeMixinable<T, O> {
+export interface ComposeFactory<T, O extends Options> extends ComposeMixinable<T, O> {
 	/**
 	 * Provide a function that mutates the factories prototype but does not change the factory's class
 	 * structure.
@@ -281,14 +664,26 @@ export interface Compose {
 	overlay<T, O>(base: ComposeFactory<T, O>, overlayFunction: OverlayFunction<T>): ComposeFactory<T, O>;
 }
 
+/**
+ * Internal implementation of the overlay functionality, to allow a function to modify a
+ * compose factory prototype
+ *
+ * @param base The target compose factory
+ * @param overlayFunction The callback function that will modify the prototype of the factory
+ */
 function overlay<T, O>(base: ComposeFactory<T, O>, overlayFunction: OverlayFunction<T>): ComposeFactory<T, O> {
-	base = cloneFactory(base);
-	overlayFunction(base.prototype);
-	return base;
+	const factory = createFactory({
+		factories: [ base ]
+	});
+	overlayFunction(factory.prototype);
+	return factory;
 }
 
 /* AOP/Inheritance API */
 
+/**
+ * A descriptor for applying advice to a set of methods
+ */
 export interface AspectAdvice {
 	/**
 	 * Any methods where the supplied advice should be applied *before* the base method is invoked
@@ -311,8 +706,11 @@ export interface AspectAdvice {
 /**
  * Either a class, object literal, or a factory
  */
-export type ComposeMixinItem<T, O> = GenericClass<T> | T | ComposeFactory<T, O>;
+export type ComposeMixinItem<T, O extends Options> = GenericClass<T> | T | ComposeFactory<T, O>;
 
+/**
+ * An object which provides information on how to mixin into a compose factory
+ */
 export interface ComposeMixinDescriptor<T, O, U, P> {
 	/**
 	 * The class, object literal, or factory to be mixed in
@@ -328,35 +726,39 @@ export interface ComposeMixinDescriptor<T, O, U, P> {
 	 * Aspect Oriented Advice to be mixed into the factory
 	 */
 	aspectAdvice?: AspectAdvice;
+
+	/**
+	 * An optional class name which is used when labelling different parts of a factory for
+	 * debugging purposes
+	 */
+	className?: string;
 }
 
 /**
- * Identifies a compose factory or other object that can be
- * transformed into a ComposeMixinDescriptor
+ * Identifies a compose factory or other object that can be transformed into a
+ * ComposeMixinDescriptor
  */
-export interface ComposeMixinable<U, P> {
+export interface ComposeMixinable<U extends Options, P> {
 	/**
 	 * A method that offers up a ComposeMixinDescriptor to allow complex mixin in of factories
 	 */
-	factoryDescriptor<T, O>(): ComposeMixinDescriptor<T, O, U, P>;
+	factoryDescriptor<T, O extends Options>(): ComposeMixinDescriptor<T, O, U, P>;
 }
 
-// export type descriptorFactory
-
-export interface ComposeFactory<T, O> extends ComposeMixinable<T, O> {
+export interface ComposeFactory<T, O extends Options> extends ComposeMixinable<T, O> {
 	/**
 	 * Mixin additional mixins, initialization logic, and aspect advice into the factory
+	 *
 	 * @param mixin An object literal that describes what to mixin
 	 */
-	mixin<U, P>(mixin: ComposeMixinable<U, P>):
-		ComposeFactory<T & U, O & P>;
-	mixin<U, P>(mixin: ComposeMixinDescriptor<T, O, U, P>):
-		ComposeFactory<T & U, O & P>;
+	mixin<U, P>(mixin: ComposeMixinable<U, P>): ComposeFactory<T & U, O & P>;
+	mixin<U, P>(mixin: ComposeMixinDescriptor<T, O, U, P>): ComposeFactory<T & U, O & P>;
 }
 
 export interface Compose {
 	/**
 	 * Mixin additional mixins, initialization logic, and aspect advice into a factory
+	 *
 	 * @param base The base factory that is the target of the mixin
 	 * @param mixin An object literal that describes what to mixin
 	 */
@@ -370,46 +772,117 @@ export interface Compose {
 	): ComposeFactory<T & U, O & P>;
 }
 
+/**
+ * Internal function that converts `AspectAdvice` into `AdviceMap` which can then be used for
+ * creating a factory
+ *
+ * @param aspectAdvice The aspect advice to convert into an advice map
+ */
+function aspectAdviceToAdviceMap(aspectAdvice: AspectAdvice | undefined): AdviceMap | undefined {
+	if (!aspectAdvice) {
+		return;
+	}
+
+	const adviceMap: AdviceMap = {};
+	const beforeAdvice = aspectAdvice.before;
+	const afterAdvice = aspectAdvice.after;
+	const aroundAdvice = aspectAdvice.around;
+
+	function mapAdvice(type: string, key: string, advice: { [ key: string ]: any }) {
+		const adviceTuple = [ type, advice[key] ] as AdviceTuple;
+		if (adviceMap[key]) {
+			adviceMap[key].push(adviceTuple);
+		}
+		else {
+			adviceMap[key] = [ adviceTuple ];
+		}
+	}
+
+	if (beforeAdvice) {
+		objectKeys(beforeAdvice).forEach((key) => {
+			/* TODO: Remove ! in 2.1 */
+			mapAdvice('before', key, beforeAdvice!);
+		});
+	}
+	if (afterAdvice) {
+		objectKeys(afterAdvice).forEach((key) => {
+			/* TODO: Remove ! in 2.1 */
+			mapAdvice('after', key, afterAdvice!);
+		});
+	}
+	if (aroundAdvice) {
+		objectKeys(aroundAdvice).forEach((key) => {
+			/* TODO: Remove ! in 2.1 */
+			mapAdvice('around', key, aroundAdvice!);
+		});
+	}
+	return adviceMap;
+}
+
+/**
+ * A custom type guard that determines if a value is ComposeMixinable
+ *
+ * @param value The value to guard for
+ */
 function isComposeMixinable(value: any): value is ComposeMixinable<any, any> {
 	return Boolean(value && 'factoryDescriptor' in value && typeof value.factoryDescriptor === 'function');
 }
 
+/**
+ * The internal implementation of mixin in values into a compose factory
+ *
+ * @param base The base compose factory that is the target for being mixed in
+ * @param toMixin The value to be mixed in
+ */
 function mixin<T, O, U, P>(
 	base: ComposeFactory<T, O>,
 	toMixin: ComposeMixinable<U, P> | ComposeMixinDescriptor<T, O, U, P>
 ): ComposeFactory<T & U, O & P> {
-	base = cloneFactory(base);
-	const baseInitFns = initFnMap.get(base);
-	const mixin = isComposeMixinable(toMixin) ? toMixin.factoryDescriptor() : toMixin;
-	const mixinType =  mixin.mixin;
-	if (mixinType) {
-		let mixinFactory = isComposeFactory(mixinType) ? mixinType : create(mixinType);
-		if (mixin.initialize) {
-			if (baseInitFns.indexOf(mixin.initialize) < 0) {
-				baseInitFns.unshift(mixin.initialize);
-			}
-		}
-		concatInitFn(base, mixinFactory);
-		copyProperties(base.prototype, mixinFactory.prototype);
+	/* ensure we are dealing with a mixinDescriptor */
+	const mixinDescriptor = isComposeMixinable(toMixin) ? toMixin.factoryDescriptor() : toMixin;
+
+	/* destructure out most of the factory creation options */
+	const { mixin, initialize: initFunction, aspectAdvice, className } = mixinDescriptor;
+
+	/* we will at least be using the base factory to create the new one */
+	const factories: ComposeFactory<any, any>[] = [ base ];
+	let proto: any;
+
+	/* if mixin is a compose factory, we will pass it as a factory used to create the new factory */
+	if (isComposeFactory(mixin)) {
+		factories.push(mixin);
 	}
-	else if (mixin.initialize) {
-		if (baseInitFns.indexOf(mixin.initialize) < 0) {
-			baseInitFns.unshift(mixin.initialize);
-		}
+	/* otherwise we are dealing with a prototype based mixin */
+	else {
+		/* of which, we can have a constructor function/class, or an object literal (or undefined) */
+		proto = typeof mixin === 'function' ? mixin.prototype : mixin;
 	}
-	if (mixin.aspectAdvice) {
-		base = aspect(base, mixin.aspectAdvice);
+
+	/* convert the advice, if any, to the format used by createFactory */
+	const advice = aspectAdviceToAdviceMap(aspectAdvice);
+
+	/* label the initFn */
+	if (initFunction) {
+		assignFunctionName(
+			initFunction,
+			`mixin${className || (isComposeFactory(mixin) && mixin.name) || base.name}`
+		);
 	}
-	return base as ComposeFactory<T & U, O & P>;
+
+	/* return the newly created factory */
+	return createFactory({
+		advice,
+		factories,
+		initFunction,
+		className,
+		proto
+	}) as ComposeFactory<T & U, O & P>;
 }
 
-export interface GenericFunction<T> {
-	(...args: any[]): T;
-}
-
-export interface ComposeFactory<T, O> extends ComposeMixinable<T, O> {
+export interface ComposeFactory<T, O extends Options> extends ComposeMixinable<T, O> {
 	/**
 	 * Extract a method from another Class or Factory and add it to the returned factory
+	 *
 	 * @param base The base Class or Factory
 	 * @param method The name of the method to extract
 	 */
@@ -417,6 +890,7 @@ export interface ComposeFactory<T, O> extends ComposeMixinable<T, O> {
 
 	/**
 	 * Apply advice *before* the named method (join-point)
+	 *
 	 * @param method The method to apply the advice to
 	 * @param advice The advice to be applied
 	 */
@@ -424,6 +898,7 @@ export interface ComposeFactory<T, O> extends ComposeMixinable<T, O> {
 
 	/**
 	 * Apply advice *after* the named method (join-point)
+	 *
 	 * @param method The method to apply the advice to
 	 * @param advice The advice to be applied
 	 */
@@ -431,6 +906,7 @@ export interface ComposeFactory<T, O> extends ComposeMixinable<T, O> {
 
 	/**
 	 * Apply advice *around* the named method (join-point)
+	 *
 	 * @param method The method to apply the advice to
 	 * @param advice The advice to be applied
 	 */
@@ -438,6 +914,7 @@ export interface ComposeFactory<T, O> extends ComposeMixinable<T, O> {
 
 	/**
 	 * Provide an object literal which can contain a map of advice to apply
+	 *
 	 * @param advice An object literal which contains the maps of advice to apply
 	 */
 	aspect(advice: AspectAdvice): this;
@@ -446,57 +923,84 @@ export interface ComposeFactory<T, O> extends ComposeMixinable<T, O> {
 export interface Compose {
 	/**
 	 * Extract a method from another Class or Factory and return it
+	 *
 	 * @param base The Class or Factory to extract from
 	 * @param method The method name to be extracted
 	 */
-	from<T extends Function>(base: GenericClass<any> | ComposeFactory<any, any>, method: string): T;
+	from<T extends Function>(base: GenericClass<any> | ComposeFactory<any, any>, method: string | symbol): T;
 
 	/**
 	 * Apply advice *before* the named method (join-point)
+	 *
 	 * @param base The Class or Factory to extract the method from
 	 * @param method The method name to apply the advice to
 	 * @param advice The advice to apply
 	 */
-	before<T>(base: GenericClass<any> | ComposeFactory<any, any>, method: string, advice: BeforeAdvice): GenericFunction<T>;
+	before<T>(base: GenericClass<any> | ComposeFactory<any, any>, method: string | symbol, advice: BeforeAdvice): GenericFunction<T>;
 	before<T>(method: GenericFunction<T>, advice: BeforeAdvice): GenericFunction<T>;
 
 	/**
 	 * Apply advice *after* the named method (join-point)
+	 *
 	 * @param base The Class or Factory to extract the method from
 	 * @param method The method name to apply the advice to
 	 * @param advice The advice to apply
 	 */
-	after<T>(base: GenericClass<any> | ComposeFactory<any, any>, method: string, advice: AfterAdvice<T>): GenericFunction<T>;
+	after<T>(base: GenericClass<any> | ComposeFactory<any, any>, method: string | symbol, advice: AfterAdvice<T>): GenericFunction<T>;
 	after<T>(method: GenericFunction<T>, advice: AfterAdvice<T>): GenericFunction<T>;
 
 	/**
 	 * Apply advice *around* the named method (join-point)
+	 *
 	 * @param base The Class or Factory to extract the method from
 	 * @param method The method name to apply the advice to
 	 * @param advice The advice to apply
 	 */
-	around<T>(base: GenericClass<any> | ComposeFactory<any, any>, method: string, advice: AroundAdvice<T>): GenericFunction<T>;
+	around<T>(base: GenericClass<any> | ComposeFactory<any, any>, method: string | symbol, advice: AroundAdvice<T>): GenericFunction<T>;
 	around<T>(method: GenericFunction<T>, advice: AroundAdvice<T>): GenericFunction<T>;
 
 	/**
 	 * Apply advice to methods that exist in the base factory using the supplied advice map
+	 *
 	 * @param base The Factory that contains the methods the advice will be applied to
 	 * @param advice The map of advice to be applied
 	 */
 	aspect<O, A>(base: ComposeFactory<O, A>, advice: AspectAdvice): ComposeFactory<O, A>;
 }
 
-function from<T extends Function>(base: GenericClass<any> | ComposeFactory<any, any>, method: string): T {
+/**
+ * Internal implementation of extracting methods from another object
+ *
+ * @param base The target that the method should be extracted from
+ * @param method The name of the method
+ */
+function from<T extends Function>(base: GenericClass<any> | ComposeFactory<any, any>, method: string | symbol): T {
 	return base.prototype[method];
 }
 
-function doFrom<T, O>(base: GenericClass<any> | ComposeFactory<any, any>, method: string): ComposeFactory<T, O> {
-	const clone = cloneFactory(this);
-	(<any> clone.prototype)[method] = base.prototype[method];
-	return clone as ComposeFactory<T, O>;
+/**
+ * Internal implementation to apply from when `this` represents the base
+ *
+ * @param base The target that the method should be extracted from
+ * @param method The name of the method
+ */
+function doFrom<T, O>(this: ComposeFactory<T, O>, base: GenericClass<any> | ComposeFactory<any, any>, method: string | symbol): ComposeFactory<T, O> {
+	return createFactory({
+		factories: [ this ],
+		proto: {
+			[method]: base.prototype[method]
+		}
+	}) as ComposeFactory<T, O>;
 }
 
-function before<T>(base: GenericClass<any> | ComposeFactory<any, any>, method: string, advice: BeforeAdvice): GenericFunction<T>;
+/**
+ * The internal implementation to apply before advice to a factory
+ *
+ * @param base The target that the advice should be applied to
+ * @param method The name of the method that the advice should be applied to
+ * @param advice The advice to apply
+ */
+function before<T>(base: GenericClass<any> | ComposeFactory<any, any>, method: string | symbol, advice: BeforeAdvice): GenericFunction<T>;
 function before<T>(method: GenericFunction<T>, advice: BeforeAdvice): GenericFunction<T>;
 function before(...args: any[]): GenericFunction<any> {
 	let base: GenericFunction<any>;
@@ -512,13 +1016,29 @@ function before(...args: any[]): GenericFunction<any> {
 	return aspectBefore(<GenericFunction<any>> method, advice);
 }
 
-function doBefore<T, O>(method: string, advice: BeforeAdvice): ComposeFactory<T, O> {
-	const clone = cloneFactory(this);
-	(<any> clone.prototype)[method] = aspectBefore((<any> clone.prototype)[method], advice);
-	return <ComposeFactory<T, O>> clone;
+/**
+ * The internal implementation to apply before advice when `this` is scoped as the base factory
+ *
+ * @param method The name of the method that the advice should be applied to
+ * @param advice The advice to apply
+ */
+function doBefore<T, O>(this: ComposeFactory<T, O>, method: string | symbol, advice: BeforeAdvice): ComposeFactory<T, O> {
+	return createFactory({
+		factories: [ this ],
+		advice: {
+			[method]: [ [ 'before', advice ] ]
+		}
+	});
 }
 
-function after<T>(base: GenericClass<any> | ComposeFactory<any, any>, method: string, advice: AfterAdvice<T>): GenericFunction<T>;
+/**
+ * The internal implementation to apply after advice to a factory
+ *
+ * @param base The target that the advice should be applied to
+ * @param method The name of the method that the advice should be applied to
+ * @param advice The advice to apply
+ */
+function after<T>(base: GenericClass<any> | ComposeFactory<any, any>, method: string | symbol, advice: AfterAdvice<T>): GenericFunction<T>;
 function after<T>(method: GenericFunction<T>, advice: AfterAdvice<T>): GenericFunction<T>;
 function after(...args: any[]): GenericFunction<any> {
 	let base: GenericFunction<any>;
@@ -534,13 +1054,28 @@ function after(...args: any[]): GenericFunction<any> {
 	return aspectAfter(<GenericFunction<any>> method, advice);
 }
 
-function doAfter<T, P, O>(method: string, advice: AfterAdvice<P>): ComposeFactory<T, O> {
-	const clone = cloneFactory(this);
-	(<any> clone.prototype)[method] = aspectAfter((<any> clone.prototype)[method], advice);
-	return <ComposeFactory <T, O>> clone;
+/**
+ * The internal implementation to apply after advice when `this` is scoped as the base factory
+ *
+ * @param method The name of the method that the advice should be applied to
+ * @param advice The advice to apply
+ */
+function doAfter<T, P, O>(this: ComposeFactory<T, O>, method: string | symbol, advice: AfterAdvice<P>): ComposeFactory<T, O> {
+	return createFactory({
+		factories: [ this ],
+		advice: {
+			[method]: [ [ 'after', advice ] ]
+		}
+	});
 }
 
-function around<T>(base: GenericClass<any> | ComposeFactory<any, any>, method: string, advice: AfterAdvice<T>): GenericFunction<T>;
+/**
+ * The internal implementation to apply after around when `this` is scoped as the base factory
+ *
+ * @param method The name of the method that the advice should be applied to
+ * @param advice The advice to apply
+ */
+function around<T>(base: GenericClass<any> | ComposeFactory<any, any>, method: string | symbol, advice: AfterAdvice<T>): GenericFunction<T>;
 function around<T>(method: GenericFunction<T>, advice: AroundAdvice<T>): GenericFunction<T>;
 function around(...args: any[]): GenericFunction<any> {
 	let base: GenericFunction<any>;
@@ -556,36 +1091,32 @@ function around(...args: any[]): GenericFunction<any> {
 	return aspectAround(<GenericFunction<any>> method, advice);
 }
 
-function doAround<T, P, O>(method: string, advice: AroundAdvice<P>): ComposeFactory<T, O> {
-	const clone = cloneFactory(this);
-	(<any> clone.prototype)[method] = aspectAround((<any> clone.prototype)[method], advice);
-	return <ComposeFactory <T, O>> clone;
+/**
+ * The internal implementation to apply around advice when `this` is scoped as the base factory
+ *
+ * @param method The name of the method that the advice should be applied to
+ * @param advice The advice to apply
+ */
+function doAround<T, P, O>(this: ComposeFactory<T, O>, method: string | symbol, advice: AroundAdvice<P>): ComposeFactory<T, O> {
+	return createFactory({
+		factories: [ this ],
+		advice: {
+			[method]: [ [ 'around', advice ] ]
+		}
+	});
 }
 
+/**
+ * The internal implementation of applying aspect advice to a factory
+ *
+ * @param base The base factory the advice should be applied to
+ * @param advice The advice map to apply to the factory
+ */
 function aspect<T, O>(base: ComposeFactory<T, O>, advice: AspectAdvice): ComposeFactory<T, O> {
-	const clone = cloneFactory(base);
-
-	function mapAdvice(adviceHash: { [method: string ]: Function }, advisor: Function): void {
-		for (let key in adviceHash) {
-			if (key in clone.prototype) {
-				(<any> clone.prototype)[key] = advisor((<any> clone.prototype)[key], adviceHash[key]);
-			}
-			else {
-				throw new Error('Trying to advise non-existing method: "' + key + '"');
-			}
-		}
-	}
-
-	if (advice.before) {
-		mapAdvice(advice.before, before);
-	}
-	if (advice.after) {
-		mapAdvice(advice.after, after);
-	}
-	if (advice.around) {
-		mapAdvice(advice.around, around);
-	}
-	return clone;
+	return createFactory({
+		factories: [ base ],
+		advice: aspectAdviceToAdviceMap(advice)
+	});
 }
 
 interface ComposeCreatedMixin<T, O> extends ComposeFactory<T, O> {
@@ -686,9 +1217,11 @@ export interface ComposeFactory<T, O> {
 }
 
 /* Creation API */
-export interface ComposeFactory<T, O> extends ComposeMixinable<T, O> {
+
+export interface ComposeFactory<T, O extends Options> extends ComposeMixinable<T, O> {
 	/**
 	 * Create a new instance
+	 *
 	 * @param options Options that are passed to the initialization functions of the factory
 	 */
 	(options?: O): T;
@@ -696,48 +1229,87 @@ export interface ComposeFactory<T, O> extends ComposeMixinable<T, O> {
 	/**
 	 * The read only prototype of the factory
 	 */
-	prototype: T;
+	readonly prototype: T;
 }
 
 export interface Compose {
 	/**
 	 * Create a new factory based on a supplied Class, Factory or Object prototype with an optional
 	 * initalization function
+	 *
 	 * @param base The base Class, Factory or Object prototype to use
 	 * @param initFunction An optional function that will be passed the instance and any creation options
+	 * @param className An optional class name that is used to label the factory for debug purposes
 	 */
-	<T, O>(base: GenericClass<T> | T, initFunction?: ComposeInitializationFunction<T, O>): ComposeFactory<T, O>;
-	<T, O, P>(base: ComposeFactory<T, O>, initFunction?: ComposeInitializationFunction<T, O & P>): ComposeFactory<T, O & P>;
+	<T, O extends Options, P extends Options>(className: string, base: ComposeFactory<T, O>, initFunction?: ComposeInitializationFunction<T, O & P>): ComposeFactory<T, O & P>;
+	<T, O extends Options>(className: string, base: GenericClass<T> | T, initFunction?: ComposeInitializationFunction<T, O>): ComposeFactory<T, O>;
+	<T, O extends Options, P extends Options>(base: ComposeFactory<T, O>, initFunction?: ComposeInitializationFunction<T, O & P>): ComposeFactory<T, O & P>;
+	<T, O extends Options>(base: GenericClass<T> | T, initFunction?: ComposeInitializationFunction<T, O>): ComposeFactory<T, O>;
 
 	/**
 	 * Create a new factory based on a supplied Class, Factory or Object prototype with an optional
 	 * initialization function
+	 *
 	 * @param base The base Class, Facotry or Object prototype to use
 	 * @param initFunction An optional function that will be passed the instance and nay creation options
 	 */
-	create<T, O>(base: GenericClass<T> | T, initFunction?: ComposeInitializationFunction<T, O>): ComposeFactory<T, O>;
+	create<T, O, P>(className: string, base: ComposeFactory<T, O>, initFunction?: ComposeInitializationFunction<T, O & P>): ComposeFactory<T, O & P>;
+	create<T, O>(className: string, base: GenericClass<T> | T, initFunction?: ComposeInitializationFunction<T, O>): ComposeFactory<T, O>;
 	create<T, O, P>(base: ComposeFactory<T, O>, initFunction?: ComposeInitializationFunction<T, O & P>): ComposeFactory<T, O & P>;
+	create<T, O>(base: GenericClass<T> | T, initFunction?: ComposeInitializationFunction<T, O>): ComposeFactory<T, O>;
 }
 
+/**
+ * The internal implementation to create a compose factory
+ *
+ * @param base The base to use for creating the factory
+ * @param initFunction Any function that should be run after the factory creates the instance
+ */
+function create<T, O>(base: GenericClass<T> | T): ComposeFactory<T, O>;
+function create<T, O>(className: string, base: GenericClass<T> | T): ComposeFactory<T, O>;
 function create<T, O>(base: GenericClass<T> | T, initFunction?: ComposeInitializationFunction<T, O>): ComposeFactory<T, O>;
+function create<T, O>(className: string, base: GenericClass<T> | T, initFunction?: ComposeInitializationFunction<T, O>): ComposeFactory<T, O>;
 function create<T, O, P>(base: ComposeFactory<T, O>, initFunction?: ComposeInitializationFunction<T, O & P>): ComposeFactory<T, O & P>;
-function create<O>(base: any, initFunction?: ComposeInitializationFunction<any, O>): any {
-	const factory = cloneFactory();
-	if (initFunction) {
-		initFnMap.get(factory).push(initFunction);
+function create<T, O, P>(className: string, base: ComposeFactory<T, O>, initFunction?: ComposeInitializationFunction<T, O & P>): ComposeFactory<T, O & P>;
+function create<O>(className: any, base?: any, initFunction?: ComposeInitializationFunction<any, O>): ComposeFactory<any, any> {
+	/* disambugate arguments */
+	if (typeof className !== 'string') {
+		initFunction = base;
+		base = className;
+		className = undefined;
 	}
 
-	/* mixin the base into the prototype */
-	copyProperties(factory.prototype, typeof base === 'function' ? base.prototype : base);
-
-	/* return the new constructor */
-	return factory;
+	/* Label the initFunction */
+	if (initFunction && className) {
+		assignFunctionName(initFunction, `init${className}`);
 	}
+
+	let factories: ComposeFactory<any, any>[] | undefined;
+	let proto: any;
+
+	/* If base is a compose factory, set it as the factory array */
+	if (base && isComposeFactory(base)) {
+		factories = [ base ];
+	}
+	/* Otherwise, we are dealing with a constructor function or a prototype */
+	else {
+		proto = typeof base === 'function' ? base.prototype : base;
+	}
+
+	return createFactory({
+		className,
+		factories,
+		initFunction,
+		proto
+	});
+}
 
 /* Extend factory with static properties */
-export interface ComposeFactory<T, O> extends ComposeMixinable<T, O> {
+
+export interface ComposeFactory<T, O extends Options> extends ComposeMixinable<T, O> {
 	/**
 	 * Add static properties to a factory
+	 *
 	 * @param staticProperties An object literal that contains methods and properties that should be "static" (e.g. added to
 	 *                         the factory, instead of the factory's prototype)
 	 */
@@ -747,34 +1319,55 @@ export interface ComposeFactory<T, O> extends ComposeMixinable<T, O> {
 export interface Compose {
 	/**
 	 * Add static properties to a factory
+	 *
 	 * @param staticProperties An object literal that contains methods and properties that should be "static" (e.g. added to
 	 *                         the factory, instead of the factory's prototype)
 	 */
-	static<F extends ComposeFactory<T, O>, T, O, S>(factory: F, staticProperties: S): F & S;
+	static<T, O, S>(factory: ComposeFactory<T, O>, staticProperties: S): ComposeFactory<T, O> & S;
 }
 
-function _static<F extends ComposeFactory<T, O>, T, O, S>(factory: F, staticProperties: S): F & S {
-	return <F & S> cloneFactory(factory, staticProperties);
+/**
+ * Internal implementation of applying static properties to a compose factory
+ *
+ * @param factory The factory that the static properties should be applied to
+ * @param staticProperties The properties to be applied to the factory
+ */
+function _static<T, O, S>(base: ComposeFactory<T, O>, staticProperties: S): ComposeFactory<T, O> & S {
+	return createFactory({
+		factories: [ base ],
+		staticProperties
+	});
+}
+
+export interface ComposeFactory<T, O extends Options> extends ComposeMixinable<T, O> {
+	/**
+	 * The class name of the ComposeFactory
+	 */
+	readonly name?: string;
 }
 
 /**
  * A factory construction utility
+ *
  * @param base An ES6 Class, ComposeFactory or Object literal to use as the base for the new factory
  * @param initFunction An optional initialization function for the factory
  */
 const compose = create as Compose;
 
 /* Add static methods to compose */
-compose.create = create;
-compose.static = _static;
-compose.extend = extend;
-compose.mixin = mixin;
-compose.overlay = overlay;
-compose.from = from;
-compose.before = before;
-compose.after = after;
-compose.around = around;
-compose.aspect = aspect;
-compose.createMixin = createMixin;
+
+assign(compose, {
+	create,
+	static: _static,
+	extend, /* DEPRECATED */
+	mixin,
+	override,
+	overlay,
+	from,
+	before,
+	after,
+	around,
+	aspect
+});
 
 export default compose;
