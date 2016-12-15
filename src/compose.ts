@@ -25,6 +25,22 @@ type AdviceMap = {
 };
 
 /**
+ * Apply this typing to an object
+ */
+type AssignThis<T> = {
+	[method: string]: ((this: T) => any) | Object;
+};
+
+/**
+ * Require an interface to be implemented
+ * and apply this typing using that interface
+ * and a pre-existing type
+ */
+type AssignThisImplementation<T, U> = {
+	[P in keyof T]: ((this: T & U) => any) | Object;
+};
+
+/**
  * Interface for storing the private meta data related to a factory
  */
 interface PrivateFactoryData {
@@ -557,7 +573,7 @@ export interface ComposeFactory<T, O extends Options> extends ComposeMixinable<T
 	 *
 	 * @param properties The properties to override
 	 */
-	override(properties: any): this;
+	override<I>(properties: AssignThisImplementation<I, T>): this;
 
 	/**
 	 * Override certain properties on the existing factory, returning a new factory.  If the properties
@@ -566,7 +582,7 @@ export interface ComposeFactory<T, O extends Options> extends ComposeMixinable<T
 	 * @param className The class name for the factory
 	 * @param properties The properties to override
 	 */
-	override(className: string, properties: any): this;
+	override<I>(className: string, properties: AssignThisImplementation<I, T>): this;
 }
 
 export interface Compose {
